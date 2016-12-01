@@ -15,70 +15,75 @@ type Mac [6]byte
 
 // QualifiedMac represents an IEEE MAC address qualified by BLE MAC Type idenfier
 type QualifiedMac struct {
-	address  Mac
-	addrType byte
+	Address  Mac
+	AddrType byte
+}
+
+// Hashable return a hashable representation of the address
+func (qm *QualifiedMac) Hashable() string {
+	return string(append(qm.Address[:], qm.AddrType))
 }
 
 // ConnectionParameters connection parameters
 type ConnectionParameters struct {
-	intervalMin uint16
+	IntervalMin uint16
 	intervalMax uint16
-	timeout     uint16
-	latency     uint16
+	Timeout     uint16
+	Latency     uint16
 }
 
 // SystemCounters result of query for system diagnostic counters
 type SystemCounters struct {
-	txok, txretry, rxok, rxfail, mbuf byte
+	Txok, Txretry, Rxok, Rxfail, Mbuf byte
 }
 
 // SystemInfo result of system information query
 type SystemInfo struct {
-	major, minor, patch, build, llVersion uint16
-	protocolVersion, hw                   byte
+	Major, Minor, Patch, Build, LLVersion uint16
+	ProtocolVersion, HW                   byte
 }
 
 // ConnectionStatus BLE connection status
 type ConnectionStatus struct {
-	connection, flags              byte
-	address                        QualifiedMac
-	connInterval, timeout, latency uint16
-	bonding                        byte
+	Connection, Flags              byte
+	Address                        QualifiedMac
+	ConnInterval, Timeout, Latency uint16
+	Bonding                        byte
 }
 
 // ConnectionVersionIndication indicates version data
 type ConnectionVersionIndication struct {
-	connection, versNr byte
-	compID, subVersNr  uint16
+	Connection, Version byte
+	CompID, SubVersion  uint16
 }
 
 // SmBondStatus security manager bonding status
 type SmBondStatus struct {
-	bond, keysize, mitm, keys byte
+	Bond, KeySize, MITM, Keys byte
 }
 
 // GapScanRespone GAP scan response indication
 type GapScanRespone struct {
-	rssi       int8
-	packetType byte
-	address    QualifiedMac
-	bond       byte
-	data       []byte
+	RSSI       int8
+	PacketType byte
+	Address    QualifiedMac
+	Bond       byte
+	Data       []byte
 }
 
 // SpiConfig SPI configuration parameters
 type SpiConfig struct {
-	polarity byte
-	phase    byte
-	bitOrder byte
-	baudE    byte
-	baudM    byte
+	Polarity byte
+	Phase    byte
+	BitOrder byte
+	BaudE    byte
+	BaudM    byte
 }
 
 // IoPortStatus IO Port Status info
 type IoPortStatus struct {
-	timestamp        uint32
-	port, irq, state byte
+	Timestamp        uint32
+	Port, Irq, State byte
 }
 
 // Delegate an API Delegate to be implemented by clients of this module
@@ -499,8 +504,8 @@ func (api *API) ConnectionGetRssi(connection byte) {
 func (api *API) ConnectionUpdate(connection byte, params *ConnectionParameters) {
 	params2 := *params
 	// FIXME confirm that these are really swapped
-	params2.latency = params.timeout
-	params2.timeout = params.latency
+	params2.Latency = params.Timeout
+	params2.Timeout = params.Latency
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, connection)
 	binary.Write(buf, binary.LittleEndian, params2)
@@ -1262,11 +1267,11 @@ func (api *API) parseGapEvent(cmdType byte, buf *bytes.Buffer) {
 	switch cmdType {
 	case 0:
 		var resp GapScanRespone
-		binary.Read(buf, binary.LittleEndian, &resp.rssi)
-		binary.Read(buf, binary.LittleEndian, &resp.packetType)
-		binary.Read(buf, binary.LittleEndian, &resp.address)
-		binary.Read(buf, binary.LittleEndian, &resp.bond)
-		resp.data = buf.Bytes()
+		binary.Read(buf, binary.LittleEndian, &resp.RSSI)
+		binary.Read(buf, binary.LittleEndian, &resp.PacketType)
+		binary.Read(buf, binary.LittleEndian, &resp.Address)
+		binary.Read(buf, binary.LittleEndian, &resp.Bond)
+		resp.Data = buf.Bytes()
 		api.delegate.OnGapScanResponse(&resp)
 	case 1:
 		var discover, connect byte
