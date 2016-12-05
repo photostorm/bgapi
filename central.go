@@ -1,10 +1,43 @@
+// this code is largely based on Michael Brown's excellent Python API
+// https://github.com/mjbrown/bgapi
+
 package bgapi
 
-import "errors"
+import (
+	"bytes"
+	"errors"
+	"time"
+)
+
+// FIXME JS -- we need to workout timeouts for global funcs
+// FIXME JS -- we need to initialize data structures etc.
+// FIXME JS -- we need to add getter/setter methods
 
 const (
-	gapFuncNone     = iota
-	gapFuncScanning = iota
+	gapFuncNone int = iota
+	gapFuncScanning
+)
+
+const (
+	// GapDiscoverLimited limitted discovery mode
+	GapDiscoverLimited byte = iota
+	// GapDiscoverGeneric generic discovery mode
+	GapDiscoverGeneric
+	// GapDiscoverObservation observation discovery mode
+	GapDiscoverObservation
+	// GapDiscoverModeMax max discovery mode
+	GapDiscoverModeMax
+)
+
+const (
+	// ConnectionStatusFlagConnected re-connected?
+	ConnectionStatusFlagConnected = 1
+	// ConnectionStatusFlagEncrypted encrypted
+	ConnectionStatusFlagEncrypted = 2
+	// ConnectionStatusFlagCompleted completed
+	ConnectionStatusFlagCompleted = 4
+	// ConnectionStatusFlagParametersChange changed the parameters
+	ConnectionStatusFlagParametersChange = 8
 )
 
 /*
@@ -44,33 +77,20 @@ const (
        }[type_ord]
 */
 
-/*
-def parse_advertisement_data(self):
-    remaining = self.data
-    while len(remaining) > 0:
-        length, = struct.unpack('B', remaining[:1])
-        gap_data = remaining[1:length+1]
+// CharacteristicUUID the characteristic UUID
+var CharacteristicUUID = []byte{0x03, 0x28}
 
-        adv_seg={}
-        adv_seg_type, = struct.unpack('B', gap_data[:1])
-        adv_seg["Type"] = self.get_ad_type_string(adv_seg_type)
-        adv_seg["Data"] = gap_data[1:]
-        self.adv_payload.append( adv_seg)
-        #print("GAP Data: %s" % ("".join(["\\x%02x" % ord(i) for i in gap_data])))
-        remaining = remaining[length+1:]
+// ClientCharacteristicConfigUUID the client characteristic config
+var ClientCharacteristicConfigUUID = []byte{0x02, 0x29}
 
-        if adv_seg_type == 0x1:  # Flags
-            pass
-        elif adv_seg_type == 0x02 or adv_seg_type == 0x03:  # Incomplete/Complete list of 16-bit UUIDs
-            for i in range(1, len(gap_data) - 1, 2):
-                self.services += [gap_data[i:i+2]]
-        elif adv_seg_type == 0x04 or adv_seg_type == 0x05:  # Incomplete list of 32-bit UUIDs
-            for i in range(1, len(gap_data) - 3, 4):
-                self.services += [gap_data[i:i+4]]
-        elif adv_seg_type == 0x06 or adv_seg_type == 0x07:  # Incomplete list of 128-bit UUIDs
-            for i in range(1, len(gap_data) - 15, 16):
-                self.services += [gap_data[i:i+16]]
-*/
+// UserDescriptionUUID the user descript
+var UserDescriptionUUID = []byte{0x01, 0x29}
+
+// PrimaryServiceUUID used to lookup primary service
+var PrimaryServiceUUID = []byte{0x00, 0x28}
+
+// SecondaryServiceUUID used to lookup secondary service
+var SecondaryServiceUUID = []byte{0x01, 0x28}
 
 type apiDelegate struct {
 	central *Central
@@ -84,6 +104,16 @@ type Central struct {
 	api              *API
 	gapFunc          int
 	knownPeripherals map[string]*GapScanRespone
+
+	// ScanInterval time from window to window
+	ScanInterval uint16
+
+	// ScanWindow time to allow devices to advertise
+	ScanWindow uint16
+
+	// existing connections
+	openConnections map[byte]*Connection
+	connections     map[string]*Connection
 }
 
 // AdvertisementData parsed advertisement data
@@ -130,6 +160,299 @@ func (c *Central) StopScanning() error {
 	}
 
 	return err
+}
+
+// ScanRequestEnable enable the transmission of ScanRequest packets
+func (c *Central) ScanRequestEnable() {
+	c.api.GapSetScanParameters(c.ScanInterval, c.ScanWindow, 1)
+}
+
+// ScanRequestDisable disable the transmission of ScanRequest packets
+func (c *Central) ScanRequestDisable() {
+	c.api.GapSetScanParameters(c.ScanInterval, c.ScanWindow, 0)
+}
+
+// StartScanBasic perform the most promiscuous scanning
+func (c *Central) StartScanBasic() error {
+	c.ScanRequestEnable()
+	return c.StartScanning(GapDiscoverObservation)
+}
+
+// StopScanBasic stop promiscuous scanning
+func (c *Central) StopScanBasic() error {
+	c.ScanRequestDisable()
+	return c.StopScanning()
+}
+
+//
+// Connetion
+//
+
+const (
+	connectionStateConnected int = iota
+	connectionStateDisconnected
+	connectionStateEncrypted
+)
+
+const (
+	procedureTimeout int = iota
+	procedureConnect
+	procedureDisconnect
+	procedureParamsUpdated
+	procedureEncrypt
+	procedureGeneral
+	procedureReadAttribute
+)
+
+// ConnectionDelegate connection delegate to be implemented by client
+type ConnectionDelegate interface {
+	OnDisconnected(reason uint16)
+}
+
+// Attribute represents GATT Characteristic Attribute
+type Attribute struct {
+	handle         uint16
+	value          []byte
+	parse          func(data []byte)
+	OnValueChanged func(data []byte)
+}
+
+// update the attribute
+func (at *Attribute) update(value []byte) {
+	at.value = value
+
+	if at.parse != nil {
+		at.parse(value)
+	}
+
+	if at.OnValueChanged != nil {
+		at.OnValueChanged(value)
+	}
+}
+
+// Characteristic represents a GATT Characteristic
+type Characteristic struct {
+	// FIXME we should probably also order these as a list
+	attribs    map[string]*Attribute
+	properties byte
+}
+
+// one UUID can have multiple handles,
+func (c *Characteristic) addDescriptor(uuid []byte, handle uint16, value []byte) *Attribute {
+	at := Attribute{handle: handle, value: value}
+
+	// CharacteristicUUID the characteristic UUID
+	if bytes.Equal(uuid, CharacteristicUUID) {
+		at.parse = func(value []byte) {
+			c.properties = value[0]
+			//var handle uint16
+			//buf := bytes.NewBuffer(value)
+			//binary.Read(buf, binary.LittleEndian, c.properties)
+			//binary.Read(buf, binary.LittleEndian, handle)
+		}
+	}
+
+	//var ClientCharacteristicConfigUUID
+
+	//var UserDescriptionUUID
+
+	c.attribs[string(uuid)] = &at
+	return &at
+}
+
+func (c *Characteristic) parseCharacteristicAttribute(value []byte) {
+}
+
+// Service GATTService
+type Service struct {
+	startHandle uint16
+	endHandle   uint16
+	uuid        []byte
+}
+
+type procedureManager struct {
+	operC       chan int
+	procPending int
+}
+
+// perform the procedure
+func (mgr *procedureManager) perform(timeoutMs time.Duration, proc int, procedure func()) error {
+
+	mgr.procPending = proc
+
+	// FIXME need a way to extend timeout
+	// start failsafe timer
+	go func() {
+		time.Sleep(timeoutMs * time.Millisecond)
+		mgr.operC <- procedureTimeout
+	}()
+
+	// perform operation
+	procedure()
+
+	// wait for result
+	result := <-mgr.operC
+
+	// check to see if the operation completed successfully
+	var err error
+	if result == procedureTimeout {
+		err = errors.New("Connection.Open timed-out")
+	} else if result != proc {
+		err = errors.New("Connection.Open handled wrong event type")
+	}
+	return err
+}
+
+// complete notify that the procedure completed
+func (mgr *procedureManager) complete(proc int) {
+	if mgr.procPending == proc {
+		mgr.operC <- proc
+	}
+}
+
+// Connection represents a connection to a peripheral
+type Connection struct {
+	resp            GapScanRespone
+	params          ConnectionParameters
+	status          ConnectionStatus
+	central         *Central
+	delegate        ConnectionDelegate
+	services        map[uint16]*Service
+	characteristics map[uint16]*Characteristic
+	attribs         map[uint16]*Attribute // find descriptor by handle
+	charByUUID      map[string]*Characteristic
+	curChar         *Characteristic // charicteristc being discovered
+	procMgr         procedureManager
+	state           int
+}
+
+// ConnectionParameters get the connection parameters
+func (c *Connection) ConnectionParameters() ConnectionParameters {
+	return c.params
+}
+
+// ConnectionStatus get the connection status
+func (c *Connection) ConnectionStatus() ConnectionStatus {
+	return c.status
+}
+
+func (c *Connection) attclientReadByGroupType(uuid []byte, timeoutMs time.Duration) error {
+	return c.procMgr.perform(timeoutMs, procedureGeneral, func() {
+		c.central.api.AttclientReadByGroupType(c.status.Connection, 1, 0xffff, uuid)
+	})
+}
+
+func (c *Connection) attclientReadByType(service *Service, char []byte, timeoutMs time.Duration) error {
+	return c.procMgr.perform(timeoutMs, procedureGeneral, func() {
+		c.central.api.AttclientReadByType(c.status.Connection,
+			service.startHandle, service.endHandle, char)
+	})
+}
+
+func (c *Connection) attclientFindInformation(service *Service, timeoutMs time.Duration) error {
+	return c.procMgr.perform(timeoutMs, procedureGeneral, func() {
+		c.central.api.AttclientFindInformation(c.status.Connection,
+			service.startHandle, service.endHandle)
+	})
+}
+
+// addService add a new service
+func (c *Connection) addService(service *Service) {
+	if c.services[service.startHandle] == nil {
+		c.services[service.startHandle] = service
+	}
+}
+
+// addCharacteristicInfo update characteristic information
+func (c *Connection) addCharacteristicInfo(chrHandle uint16, uuid []byte) {
+	if bytes.Equal(uuid, CharacteristicUUID) {
+		// found the characteristic UUID -- always listed first in a characteristic
+		// and designates the begginging of a new char decl
+		c.curChar = &Characteristic{}
+		c.characteristics[chrHandle] = c.curChar
+	}
+
+	// populate the descriptor tables
+	c.attribs[chrHandle] = c.curChar.addDescriptor(uuid, chrHandle, []byte{})
+}
+
+// updateStatus update connection status
+func (c *Connection) updateStatus(status *ConnectionStatus) {
+	c.status = *status
+
+	if status.Flags&ConnectionStatusFlagCompleted != 0 {
+		// connection attempt succeeded
+		if c.central.openConnections[status.Connection] == nil {
+			// notify listern that the connection attempt succeeded
+			c.central.openConnections[status.Connection] = c
+			c.state = connectionStateConnected
+			c.procMgr.complete(procedureConnect)
+		}
+	} else if status.Flags&ConnectionStatusFlagParametersChange != 0 {
+		c.procMgr.complete(procedureParamsUpdated)
+	} else if status.Flags&ConnectionStatusFlagEncrypted != 0 {
+		c.state = connectionStateEncrypted
+		c.procMgr.complete(procedureEncrypt)
+	}
+}
+
+// Open open connection
+func (c *Connection) Open() error {
+	var timeout time.Duration = 5000
+	err := c.procMgr.perform(timeout, connectionStateConnected, func() {
+		c.central.api.GapConnectDirect(c.resp.Address, &c.params)
+	})
+
+	if err == nil {
+		// FIXME need to define these timeouts as global variables
+		// FIXME timeout
+		// connection is Open, query the primary service to find out what services are supported
+		// these will be registered
+		c.attclientReadByGroupType(PrimaryServiceUUID, timeout)
+
+		// FIXME we need to add timeouts to the API
+		// iterate through the list of services to discover the characteristics
+		for _, s := range c.services {
+			if err = c.attclientFindInformation(s, timeout); err != nil {
+				break
+			}
+
+			if err = c.attclientReadByType(s, CharacteristicUUID, timeout); err != nil {
+				break
+			}
+
+			if err = c.attclientReadByType(s, ClientCharacteristicConfigUUID, timeout); err != nil {
+				break
+			}
+
+			if err = c.attclientReadByType(s, UserDescriptionUUID, timeout); err != nil {
+				break
+			}
+		}
+	}
+
+	return err
+}
+
+// CharacteristicForUUID returns the Characteristic for the given UUID
+func (c *Connection) CharacteristicForUUID(uuid []byte) *Characteristic {
+	return c.charByUUID[string(uuid)]
+}
+
+// CharacteristicByHandle returns the Characteristic for the given handle
+func (c *Connection) CharacteristicByHandle(handle uint16) *Characteristic {
+	return c.characteristics[handle]
+}
+
+// NewConnection construct a new connection
+func (c *Central) NewConnection(resp *GapScanRespone, params *ConnectionParameters) *Connection {
+	var conn = c.connections[resp.Address.Hashable()]
+	if conn == nil {
+		conn = &Connection{resp: *resp, params: *params, central: c}
+		c.connections[resp.Address.Hashable()] = conn
+	}
+
+	return conn
 }
 
 // ParseGapScanResponse parse a scan response
@@ -225,8 +548,7 @@ func (dgt *apiDelegate) OnFlashPsKey(key uint16, value []byte) {
 }
 
 // OnAttributeValue invoked when attribute value changes
-func (dgt *apiDelegate) OnAttributeValue(connection byte, reason byte, handle uint16, offset uint16, value []byte) {
-
+func (dgt *apiDelegate) OnAttributeValue(connHandle byte, reason byte, handle uint16, offset uint16, value []byte) {
 }
 
 // OnAttributeUserReadRequest inovked by user read request
@@ -241,6 +563,11 @@ func (dgt *apiDelegate) OnAttributeStatus(handle uint16, flags byte) {
 
 // OnConnectionStatus invoked when the connection status changes
 func (dgt *apiDelegate) OnConnectionStatus(status *ConnectionStatus) {
+	// connection is already open
+	var conn = dgt.central.connections[status.Address.Hashable()]
+	if conn != nil {
+		conn.updateStatus(status)
+	}
 }
 
 // OnConnectionVersionIndication invoked when version indication is updated
@@ -256,7 +583,14 @@ func (dgt *apiDelegate) OnConnectionRawRx(connection byte, data []byte) {
 }
 
 // OnConnectionDisconnected invoked when the connection is lost
-func (dgt *apiDelegate) OnConnectionDisconnected(connection byte, reason uint16) {
+func (dgt *apiDelegate) OnConnectionDisconnected(handle byte, reason uint16) {
+	conn := dgt.central.openConnections[handle]
+	if conn != nil {
+		dgt.central.openConnections[handle] = nil
+		conn.state = connectionStateDisconnected
+		conn.procMgr.complete(procedureDisconnect)
+		conn.delegate.OnDisconnected(reason)
+	}
 }
 
 // OnAttrclientIndicated inovked when an attribute is indicated
@@ -264,23 +598,40 @@ func (dgt *apiDelegate) OnAttrclientIndicated(connection byte, attrHandle uint16
 }
 
 // OnAttrclientProcedureCompleted invoked upon procedure completion
-func (dgt *apiDelegate) OnAttrclientProcedureCompleted(connection byte, result uint16, chrHandle uint16) {
+func (dgt *apiDelegate) OnAttrclientProcedureCompleted(connHandle byte, result uint16, chrHandle uint16) {
+	if conn := dgt.central.openConnections[connHandle]; conn != nil {
+		conn.procMgr.complete(procedureGeneral)
+	}
 }
 
 // OnAttrclientGroupFound invoked when the group is found
-func (dgt *apiDelegate) OnAttrclientGroupFound(connection byte, start uint16, end uint16, uuid []byte) {
+func (dgt *apiDelegate) OnAttrclientGroupFound(connHandle byte, start uint16, end uint16, uuid []byte) {
+	if conn := dgt.central.openConnections[connHandle]; conn != nil {
+		conn.addService(&Service{startHandle: start, endHandle: end, uuid: uuid})
+	}
 }
 
 // OnAttrclientAttributeFound invoked when the attribute is found
 func (dgt *apiDelegate) OnAttrclientAttributeFound(connection byte, chrdecl uint16, value uint16, properties byte, uuid []byte) {
+
 }
 
 // OnAttrclientFindInformationFound invoked when information is available
-func (dgt *apiDelegate) OnAttrclientFindInformationFound(connection byte, chrHandle uint16, uuid []byte) {
+func (dgt *apiDelegate) OnAttrclientFindInformationFound(connHandle byte, chrHandle uint16, uuid []byte) {
+	if conn := dgt.central.openConnections[connHandle]; conn != nil {
+		conn.addCharacteristicInfo(chrHandle, uuid)
+	}
 }
 
 // OnAttrclientAttributeValue invoked when value changes
-func (dgt *apiDelegate) OnAttrclientAttributeValue(connection byte, attHandle uint16, valueType byte, value []byte) {
+func (dgt *apiDelegate) OnAttrclientAttributeValue(connHandle byte, atrHandle uint16, valueType byte, value []byte) {
+	if conn := dgt.central.openConnections[connHandle]; conn != nil {
+		if at := conn.attribs[atrHandle]; at != nil {
+			at.update(value)
+		}
+
+		conn.procMgr.complete(procedureReadAttribute) // FIXME What about indications etc?
+	}
 }
 
 // OnAttrclientReadMultipleResponse invoked when the client responds

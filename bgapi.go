@@ -1,3 +1,6 @@
+// this code is largely based on Michael Brown's excellent Python API
+// https://github.com/mjbrown/bgapi
+
 package bgapi
 
 // TODO take care of some initialization
@@ -5,9 +8,15 @@ package bgapi
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"time"
 
-	"github.com/golang-collections/go-datastructures/queue"
 	"github.com/tarm/serial"
+)
+
+const (
+	defaultTimeoutMs = 1000
 )
 
 // Mac represents an IEEE MAC address
@@ -212,12 +221,22 @@ func (fr *bgFrameReader) next() ([]byte, *bgFrameHeader) {
 	return fr.buf.Next(fr.header.frameLengthGet()), &fr.header
 }
 
+type operation struct {
+	class      byte
+	cmd        byte
+	completion func(*bytes.Buffer, error)
+	txData     []byte
+	timeout    time.Duration
+}
+
 // API for low-level BLED112 access
 type API struct {
-	ser      *serial.Port
-	operQue  *queue.Queue
-	delegate Delegate
-	framer   *bgFrameReader
+	ser       *serial.Port
+	txC       chan *operation
+	rxReplyC  chan error
+	pendingOp *operation
+	delegate  Delegate
+	framer    bgFrameReader
 }
 
 func boolCast(boolean bool) byte {
@@ -228,14 +247,69 @@ func boolCast(boolean bool) byte {
 	return 0
 }
 
-func (api *API) send(class byte, cmd byte, data []byte, completion func(*bytes.Buffer)) {
+// NewAPI returns a new API structure
+func NewAPI(delegate Delegate) *API {
+	var api = API{delegate: delegate}
+	return &api
+}
+
+// OpenBLED112 open the conneciton to the BLED112
+func (api *API) OpenBLED112(port string) {
+	cfg := serial.Config{Name: port, Baud: 115200}
+	if ser, err := serial.OpenPort(&cfg); err == nil {
+		api.ser = ser
+
+		// handle receiving data
+		go func() {
+			var data = make([]byte, 128)
+			for true {
+				if n, err := api.ser.Read(data); err == nil {
+					api.onSerialPortData(data[:n])
+				}
+			}
+		}()
+
+		go func() {
+			for true {
+				op := <-api.txC
+				// FIXME need to handle errors
+				api.ser.Write(op.txData)
+				api.ser.Flush()
+
+				select {
+				case _ = <-api.rxReplyC:
+					// reply received, continue
+				case <-time.After(op.timeout * time.Millisecond):
+					op.completion(nil, errors.New("operation timed-out"))
+				}
+			}
+		}()
+	}
+}
+
+func (api *API) sendWithTimeout(class byte, cmd byte, data []byte, timeoutMs time.Duration, completion func(*bytes.Buffer)) error {
 	// encode the command
-	api.operQue.Put(completion)
+
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, class)
 	binary.Write(buf, binary.LittleEndian, cmd)
 	binary.Write(buf, binary.LittleEndian, data)
-	api.ser.Write(buf.Bytes())
+
+	var ret error
+	api.txC <- &operation{class: class, cmd: cmd, txData: data, timeout: timeoutMs,
+		completion: func(buf *bytes.Buffer, err error) {
+			if err == nil {
+				completion(buf)
+			}
+			ret = err
+		},
+	}
+
+	return ret
+}
+
+func (api *API) send(class byte, cmd byte, data []byte, completion func(*bytes.Buffer)) error {
+	return api.sendWithTimeout(class, cmd, data, defaultTimeoutMs, completion)
 }
 
 // handle receiveing data from the serial port
@@ -246,12 +320,15 @@ func (api *API) onSerialPortData(data []byte) {
 		buf := bytes.NewBuffer(frame)
 		switch hdr.messageTypeGet() {
 		case 0:
-			if handlers, err := api.operQue.Get(1); err != nil {
-				handler := handlers[0]
-				if handler != nil {
-					// unbox the handler and invoke it
-					handler.(func(*bytes.Buffer))(buf)
+			if api.pendingOp != nil {
+				var err error
+				if (api.pendingOp.class != hdr.packetClass) || (api.pendingOp.cmd != hdr.packetCommand) {
+					err = errors.New("received incorrect response type")
 				}
+				api.pendingOp.completion(buf, err)
+				api.rxReplyC <- nil
+			} else {
+				fmt.Println("FIXME received bad header!")
 			}
 		case 1:
 			api.parseEvent(hdr, buf)
@@ -260,23 +337,23 @@ func (api *API) onSerialPortData(data []byte) {
 }
 
 // SystemReset perform module reset
-func (api *API) SystemReset(bootInDfu bool, completion func()) {
+func (api *API) SystemReset(bootInDfu bool, completion func()) error {
 	data := []byte{boolCast(bootInDfu)}
-	api.send(0, 0, data, func(*bytes.Buffer) {
+	return api.send(0, 0, data, func(*bytes.Buffer) {
 		completion()
 	})
 }
 
 // SystemHello say hello
-func (api *API) SystemHello(completion func()) {
-	api.send(0, 1, []byte{}, func(*bytes.Buffer) {
+func (api *API) SystemHello(completion func()) error {
+	return api.send(0, 1, []byte{}, func(*bytes.Buffer) {
 		completion()
 	})
 }
 
 // SystemAddressGet get the address
-func (api *API) SystemAddressGet(completion func(Mac)) {
-	api.send(0, 2, []byte{}, func(buf *bytes.Buffer) {
+func (api *API) SystemAddressGet(completion func(Mac)) error {
+	return api.send(0, 2, []byte{}, func(buf *bytes.Buffer) {
 		var mac Mac
 		binary.Read(buf, binary.LittleEndian, mac)
 		completion(mac)
@@ -284,11 +361,11 @@ func (api *API) SystemAddressGet(completion func(Mac)) {
 }
 
 // SystemRegWrite write device register
-func (api *API) SystemRegWrite(addr uint16, value uint8, completion func(uint16)) {
+func (api *API) SystemRegWrite(addr uint16, value uint8, completion func(uint16)) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, addr)
 	binary.Write(buf, binary.LittleEndian, value)
-	api.send(0, 3, buf.Bytes(), func(buf *bytes.Buffer) {
+	return api.send(0, 3, buf.Bytes(), func(buf *bytes.Buffer) {
 		var value uint16
 		binary.Read(buf, binary.LittleEndian, &value)
 		completion(value)
@@ -296,10 +373,10 @@ func (api *API) SystemRegWrite(addr uint16, value uint8, completion func(uint16)
 }
 
 // SystemRegRead read device register
-func (api *API) SystemRegRead(addr uint16, completion func(uint16, uint8)) {
+func (api *API) SystemRegRead(addr uint16, completion func(uint16, uint8)) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, addr)
-	api.send(0, 4, []byte{}, func(buf *bytes.Buffer) {
+	return api.send(0, 4, []byte{}, func(buf *bytes.Buffer) {
 		var rxAddr uint16
 		var value uint8
 		binary.Read(buf, binary.LittleEndian, &rxAddr)
@@ -309,8 +386,8 @@ func (api *API) SystemRegRead(addr uint16, completion func(uint16, uint8)) {
 }
 
 // SystemCountersGet get the counters
-func (api *API) SystemCountersGet(completion func(*SystemCounters)) {
-	api.send(0, 5, []byte{}, func(buf *bytes.Buffer) {
+func (api *API) SystemCountersGet(completion func(*SystemCounters)) error {
+	return api.send(0, 5, []byte{}, func(buf *bytes.Buffer) {
 		var counters = SystemCounters{}
 		binary.Read(buf, binary.LittleEndian, &counters)
 		completion(&counters)
@@ -318,8 +395,8 @@ func (api *API) SystemCountersGet(completion func(*SystemCounters)) {
 }
 
 // SystemConnectionsGet get the connections
-func (api *API) SystemConnectionsGet(completion func(uint8)) {
-	api.send(0, 6, []byte{}, func(buf *bytes.Buffer) {
+func (api *API) SystemConnectionsGet(completion func(uint8)) error {
+	return api.send(0, 6, []byte{}, func(buf *bytes.Buffer) {
 		var maxConn uint8
 		binary.Read(buf, binary.LittleEndian, &maxConn)
 		completion(maxConn)
@@ -327,11 +404,11 @@ func (api *API) SystemConnectionsGet(completion func(uint8)) {
 }
 
 // SystemMemoryRead read memory
-func (api *API) SystemMemoryRead(addr uint16, length uint8, completion func(uint32, []byte)) {
+func (api *API) SystemMemoryRead(addr uint16, length uint8, completion func(uint32, []byte)) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, addr)
 	binary.Write(buf, binary.LittleEndian, length)
-	api.send(0, 7, buf.Bytes(), func(buf *bytes.Buffer) {
+	return api.send(0, 7, buf.Bytes(), func(buf *bytes.Buffer) {
 		var rxAddr uint32
 		var dataLen uint8
 		binary.Read(buf, binary.LittleEndian, &rxAddr)
@@ -341,8 +418,8 @@ func (api *API) SystemMemoryRead(addr uint16, length uint8, completion func(uint
 }
 
 // SystemInfoGet get system informaiton
-func (api *API) SystemInfoGet(completion func(*SystemInfo)) {
-	api.send(0, 8, []byte{}, func(buf *bytes.Buffer) {
+func (api *API) SystemInfoGet(completion func(*SystemInfo)) error {
+	return api.send(0, 8, []byte{}, func(buf *bytes.Buffer) {
 		var info SystemInfo
 		binary.Read(buf, binary.LittleEndian, &info)
 		completion(&info)
@@ -350,12 +427,12 @@ func (api *API) SystemInfoGet(completion func(*SystemInfo)) {
 }
 
 // SystemEndpointTx transmit endpoint
-func (api *API) SystemEndpointTx(endpoint byte, data []byte, completion func(uint16)) {
+func (api *API) SystemEndpointTx(endpoint byte, data []byte, completion func(uint16)) error {
 	args := []byte{endpoint, byte(len(data))}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, args)
 	binary.Write(buf, binary.LittleEndian, buf)
-	api.send(0, 9, buf.Bytes(), func(buf *bytes.Buffer) {
+	return api.send(0, 9, buf.Bytes(), func(buf *bytes.Buffer) {
 		var endpoint uint16
 		binary.Read(buf, binary.LittleEndian, endpoint)
 		completion(endpoint)
@@ -363,10 +440,10 @@ func (api *API) SystemEndpointTx(endpoint byte, data []byte, completion func(uin
 }
 
 // SystemWhitelistAppend append mac to whitelist
-func (api *API) SystemWhitelistAppend(address QualifiedMac, completion func(uint16)) {
+func (api *API) SystemWhitelistAppend(address QualifiedMac, completion func(uint16)) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, address)
-	api.send(0, 10, buf.Bytes(), func(buf *bytes.Buffer) {
+	return api.send(0, 10, buf.Bytes(), func(buf *bytes.Buffer) {
 		var result uint16
 		binary.Read(buf, binary.LittleEndian, result)
 		completion(result)
@@ -374,134 +451,134 @@ func (api *API) SystemWhitelistAppend(address QualifiedMac, completion func(uint
 }
 
 // SystemWhitelistRemove remove mac from whitelist
-func (api *API) SystemWhitelistRemove(address QualifiedMac) {
+func (api *API) SystemWhitelistRemove(address QualifiedMac) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, address)
-	api.send(0, 11, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(0, 11, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // SystemWhitelistClear clear the whitelist
-func (api *API) SystemWhitelistClear() {
-	api.send(0, 12, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) SystemWhitelistClear() error {
+	return api.send(0, 12, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // SystemEndpointRx receive whitelist
-func (api *API) SystemEndpointRx(endpoint byte, size byte) {
-	api.send(0, 13, []byte{endpoint, size}, func(buf *bytes.Buffer) {})
+func (api *API) SystemEndpointRx(endpoint byte, size byte) error {
+	return api.send(0, 13, []byte{endpoint, size}, func(buf *bytes.Buffer) {})
 }
 
 // SystemEndpointSetWatermarks set watermarks
-func (api *API) SystemEndpointSetWatermarks(endpoint byte, rx byte, tx byte) {
-	api.send(0, 14, []byte{endpoint, rx, tx}, func(buf *bytes.Buffer) {})
+func (api *API) SystemEndpointSetWatermarks(endpoint byte, rx byte, tx byte) error {
+	return api.send(0, 14, []byte{endpoint, rx, tx}, func(buf *bytes.Buffer) {})
 }
 
 // FlashPsDefrag defragment flash
-func (api *API) FlashPsDefrag() {
-	api.send(1, 0, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) FlashPsDefrag() error {
+	return api.send(1, 0, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // FlashPsDump dump flash
-func (api *API) FlashPsDump() {
-	api.send(1, 1, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) FlashPsDump() error {
+	return api.send(1, 1, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // FlashPsEraseAll erase flash
-func (api *API) FlashPsEraseAll() {
-	api.send(1, 2, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) FlashPsEraseAll() error {
+	return api.send(1, 2, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // FlashPsSave save key value pair
-func (api *API) FlashPsSave(key uint16, value []byte) {
+func (api *API) FlashPsSave(key uint16, value []byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, key)
 	binary.Write(buf, binary.LittleEndian, byte(len(value)))
 	binary.Write(buf, binary.LittleEndian, value)
-	api.send(1, 3, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(1, 3, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // FlashPsLoad load key value pair
-func (api *API) FlashPsLoad(key uint16) {
+func (api *API) FlashPsLoad(key uint16) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, key)
-	api.send(1, 4, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(1, 4, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // FlashPsErase erase key value pair
-func (api *API) FlashPsErase(key uint16) {
+func (api *API) FlashPsErase(key uint16) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, key)
-	api.send(1, 5, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(1, 5, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // FlashErasePage erase page
-func (api *API) FlashErasePage(page byte) {
-	api.send(1, 5, []byte{page}, func(buf *bytes.Buffer) {})
+func (api *API) FlashErasePage(page byte) error {
+	return api.send(1, 5, []byte{page}, func(buf *bytes.Buffer) {})
 }
 
 // FlashWriteWords write words
-func (api *API) FlashWriteWords(address uint16, words []byte) {
+func (api *API) FlashWriteWords(address uint16, words []byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, address)
 	binary.Write(buf, binary.LittleEndian, byte(len(words)))
 	binary.Write(buf, binary.LittleEndian, words)
-	api.send(1, 7, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(1, 7, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttributesWrite write attributes
-func (api *API) AttributesWrite(handle uint16, offset byte, value []byte) {
+func (api *API) AttributesWrite(handle uint16, offset byte, value []byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, handle)
 	binary.Write(buf, binary.LittleEndian, offset)
 	binary.Write(buf, binary.LittleEndian, byte(len(value)))
 	binary.Write(buf, binary.LittleEndian, value)
-	api.send(2, 0, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(2, 0, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttributesRead read attributes
-func (api *API) AttributesRead(handle uint16, offset byte) {
+func (api *API) AttributesRead(handle uint16, offset byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, handle)
 	binary.Write(buf, binary.LittleEndian, offset)
-	api.send(2, 1, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(2, 1, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttributesReadType read attributes type
-func (api *API) AttributesReadType(handle uint16) {
+func (api *API) AttributesReadType(handle uint16) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, handle)
-	api.send(2, 2, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(2, 2, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttributesUserReadResponse read user response
-func (api *API) AttributesUserReadResponse(connection byte, attError byte, value []byte) {
+func (api *API) AttributesUserReadResponse(connection byte, attError byte, value []byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, connection)
 	binary.Write(buf, binary.LittleEndian, attError)
 	binary.Write(buf, binary.LittleEndian, byte(len(value)))
 	binary.Write(buf, binary.LittleEndian, value)
-	api.send(2, 3, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(2, 3, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttributesUserWriteResponse write response
-func (api *API) AttributesUserWriteResponse(connection byte, attError byte) {
+func (api *API) AttributesUserWriteResponse(connection byte, attError byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, connection)
 	binary.Write(buf, binary.LittleEndian, attError)
-	api.send(2, 4, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(2, 4, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // ConnectionDisconnect disconnect
-func (api *API) ConnectionDisconnect(connection byte) {
-	api.send(3, 0, []byte{connection}, func(buf *bytes.Buffer) {})
+func (api *API) ConnectionDisconnect(connection byte) error {
+	return api.send(3, 0, []byte{connection}, func(buf *bytes.Buffer) {})
 }
 
 // ConnectionGetRssi get the RSSI value
-func (api *API) ConnectionGetRssi(connection byte) {
-	api.send(3, 1, []byte{connection}, func(buf *bytes.Buffer) {})
+func (api *API) ConnectionGetRssi(connection byte) error {
+	return api.send(3, 1, []byte{connection}, func(buf *bytes.Buffer) {})
 }
 
 // ConnectionUpdate update connection params
-func (api *API) ConnectionUpdate(connection byte, params *ConnectionParameters) {
+func (api *API) ConnectionUpdate(connection byte, params *ConnectionParameters) error {
 	params2 := *params
 	// FIXME confirm that these are really swapped
 	params2.Latency = params.Timeout
@@ -510,41 +587,41 @@ func (api *API) ConnectionUpdate(connection byte, params *ConnectionParameters) 
 	binary.Write(buf, binary.LittleEndian, connection)
 	binary.Write(buf, binary.LittleEndian, params2)
 
-	api.send(3, 2, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(3, 2, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // ConnectionVersionUpdate update version
-func (api *API) ConnectionVersionUpdate(connection byte) {
-	api.send(3, 3, []byte{connection}, func(buf *bytes.Buffer) {})
+func (api *API) ConnectionVersionUpdate(connection byte) error {
+	return api.send(3, 3, []byte{connection}, func(buf *bytes.Buffer) {})
 }
 
 // ConnectionChannelMapGet get channel mapping
-func (api *API) ConnectionChannelMapGet(connection byte) {
-	api.send(3, 4, []byte{connection}, func(buf *bytes.Buffer) {})
+func (api *API) ConnectionChannelMapGet(connection byte) error {
+	return api.send(3, 4, []byte{connection}, func(buf *bytes.Buffer) {})
 }
 
 // ConnectionChannelMapSet set channel mapping
-func (api *API) ConnectionChannelMapSet(connection byte, connMap []byte) {
-	api.send(3, 5, append([]byte{connection, byte(len(connMap))}, connMap...), func(buf *bytes.Buffer) {})
+func (api *API) ConnectionChannelMapSet(connection byte, connMap []byte) error {
+	return api.send(3, 5, append([]byte{connection, byte(len(connMap))}, connMap...), func(buf *bytes.Buffer) {})
 }
 
 // ConnectionFeaturesGet get connection features
-func (api *API) ConnectionFeaturesGet(connection byte) {
-	api.send(3, 6, []byte{connection}, func(buf *bytes.Buffer) {})
+func (api *API) ConnectionFeaturesGet(connection byte) error {
+	return api.send(3, 6, []byte{connection}, func(buf *bytes.Buffer) {})
 }
 
 // ConnectionStatusGet get connection status
-func (api *API) ConnectionStatusGet(connection byte) {
-	api.send(3, 7, []byte{connection}, func(buf *bytes.Buffer) {})
+func (api *API) ConnectionStatusGet(connection byte) error {
+	return api.send(3, 7, []byte{connection}, func(buf *bytes.Buffer) {})
 }
 
 // ConnectionRawTx transmit raw data
-func (api *API) ConnectionRawTx(connection byte, data []byte) {
-	api.send(3, 8, append([]byte{connection, byte(len(data))}, data...), func(buf *bytes.Buffer) {})
+func (api *API) ConnectionRawTx(connection byte, data []byte) error {
+	return api.send(3, 8, append([]byte{connection, byte(len(data))}, data...), func(buf *bytes.Buffer) {})
 }
 
 // AttclientFindByTypeValue find attribute client by type
-func (api *API) AttclientFindByTypeValue(connection byte, start uint16, end uint16, uuid uint16, value []byte) {
+func (api *API) AttclientFindByTypeValue(connection byte, start uint16, end uint16, uuid uint16, value []byte) error {
 	data := struct {
 		connection byte
 		start      uint16
@@ -562,11 +639,12 @@ func (api *API) AttclientFindByTypeValue(connection byte, start uint16, end uint
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, data)
-	api.send(4, 0, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 0, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
-// AttclientReadByGroupType read by group type
-func (api *API) AttclientReadByGroupType(connection byte, start uint16, end uint16, uuid []byte) {
+// AttclientReadByGroupType query for discovered services
+// NOTE: Discovered services are reported by OnAttrclientGroupFound
+func (api *API) AttclientReadByGroupType(connection byte, start uint16, end uint16, uuid []byte) error {
 	data := struct {
 		connection byte
 		start      uint16
@@ -582,11 +660,11 @@ func (api *API) AttclientReadByGroupType(connection byte, start uint16, end uint
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, data)
-	api.send(4, 1, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 1, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttclientReadByType read by group type
-func (api *API) AttclientReadByType(connection byte, start uint16, end uint16, uuid []byte) {
+func (api *API) AttclientReadByType(connection byte, start uint16, end uint16, uuid []byte) error {
 	data := struct {
 		connection byte
 		start      uint16
@@ -602,11 +680,11 @@ func (api *API) AttclientReadByType(connection byte, start uint16, end uint16, u
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, data)
-	api.send(4, 2, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 2, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttclientFindInformation find information
-func (api *API) AttclientFindInformation(connection byte, start uint16, end uint16) {
+func (api *API) AttclientFindInformation(connection byte, start uint16, end uint16) error {
 	data := struct {
 		connection byte
 		start      uint16
@@ -618,11 +696,11 @@ func (api *API) AttclientFindInformation(connection byte, start uint16, end uint
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, data)
-	api.send(4, 3, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 3, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttclientReadByHandle read by characteristic handle
-func (api *API) AttclientReadByHandle(connection byte, handle uint16) {
+func (api *API) AttclientReadByHandle(connection byte, handle uint16) error {
 	data := struct {
 		connection byte
 		handle     uint16
@@ -632,11 +710,11 @@ func (api *API) AttclientReadByHandle(connection byte, handle uint16) {
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, data)
-	api.send(4, 4, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 4, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttclientAttributeWrite write to an attribute
-func (api *API) AttclientAttributeWrite(connection byte, handle uint16, data []uint8) {
+func (api *API) AttclientAttributeWrite(connection byte, handle uint16, data []uint8) error {
 	toSend := struct {
 		connection byte
 		handle     uint16
@@ -650,11 +728,11 @@ func (api *API) AttclientAttributeWrite(connection byte, handle uint16, data []u
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, toSend)
-	api.send(4, 5, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 5, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttclientWriteCommand write command data
-func (api *API) AttclientWriteCommand(connection byte, handle uint16, data []uint8) {
+func (api *API) AttclientWriteCommand(connection byte, handle uint16, data []uint8) error {
 	toSend := struct {
 		connection byte
 		handle     uint16
@@ -668,16 +746,16 @@ func (api *API) AttclientWriteCommand(connection byte, handle uint16, data []uin
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, toSend)
-	api.send(4, 6, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 6, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttrclientIndicateConfirm confirm indication
-func (api *API) AttrclientIndicateConfirm(connection byte) {
-	api.send(4, 7, []byte{connection}, func(buf *bytes.Buffer) {})
+func (api *API) AttrclientIndicateConfirm(connection byte) error {
+	return api.send(4, 7, []byte{connection}, func(buf *bytes.Buffer) {})
 }
 
 // AttclientReadLong iniiate a long read
-func (api *API) AttclientReadLong(connection byte, handle uint16) {
+func (api *API) AttclientReadLong(connection byte, handle uint16) error {
 	data := struct {
 		connection byte
 		handle     uint16
@@ -687,11 +765,11 @@ func (api *API) AttclientReadLong(connection byte, handle uint16) {
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, data)
-	api.send(4, 8, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 8, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttclientPrepareWrite prepare to write
-func (api *API) AttclientPrepareWrite(connection byte, handle uint16, offset uint16, data []byte) {
+func (api *API) AttclientPrepareWrite(connection byte, handle uint16, offset uint16, data []byte) error {
 	toSend := struct {
 		connection byte
 		handle     uint16
@@ -707,245 +785,245 @@ func (api *API) AttclientPrepareWrite(connection byte, handle uint16, offset uin
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, toSend)
-	api.send(4, 9, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 9, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // AttrclientExecuteWrite execute write
-func (api *API) AttrclientExecuteWrite(connection byte, commit byte) {
-	api.send(4, 10, []byte{commit}, func(buf *bytes.Buffer) {})
+func (api *API) AttrclientExecuteWrite(connection byte, commit byte) error {
+	return api.send(4, 10, []byte{commit}, func(buf *bytes.Buffer) {})
 }
 
 // AttrclientReadMultiple read multiple handles (FIXME should it be uint16)
-func (api *API) AttrclientReadMultiple(connection byte, handles []byte) {
+func (api *API) AttrclientReadMultiple(connection byte, handles []byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, connection)
 	binary.Write(buf, binary.LittleEndian, byte(len(handles)))
 	binary.Write(buf, binary.LittleEndian, handles)
-	api.send(4, 11, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(4, 11, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // SmEncryptStart start encryption
-func (api *API) SmEncryptStart(handle byte, bonding byte) {
-	api.send(5, 0, []byte{handle, bonding}, func(buf *bytes.Buffer) {})
+func (api *API) SmEncryptStart(handle byte, bonding byte) error {
+	return api.send(5, 0, []byte{handle, bonding}, func(buf *bytes.Buffer) {})
 }
 
 // SmSetBondableMode set bondable mode
-func (api *API) SmSetBondableMode(bondable byte) {
-	api.send(5, 1, []byte{bondable}, func(buf *bytes.Buffer) {})
+func (api *API) SmSetBondableMode(bondable byte) error {
+	return api.send(5, 1, []byte{bondable}, func(buf *bytes.Buffer) {})
 }
 
 // SmDeleteBonding delete bonding
-func (api *API) SmDeleteBonding(handle byte) {
-	api.send(5, 2, []byte{handle}, func(buf *bytes.Buffer) {})
+func (api *API) SmDeleteBonding(handle byte) error {
+	return api.send(5, 2, []byte{handle}, func(buf *bytes.Buffer) {})
 }
 
 // SmSetParameters set security parameters
-func (api *API) SmSetParameters(mitm byte, minKeySize byte, ioCapabilities byte) {
-	api.send(5, 3, []byte{mitm, minKeySize, ioCapabilities}, func(buf *bytes.Buffer) {})
+func (api *API) SmSetParameters(mitm byte, minKeySize byte, ioCapabilities byte) error {
+	return api.send(5, 3, []byte{mitm, minKeySize, ioCapabilities}, func(buf *bytes.Buffer) {})
 }
 
 // SmPasskeyEntry set security passkey
-func (api *API) SmPasskeyEntry(handle byte, passkey uint32) {
+func (api *API) SmPasskeyEntry(handle byte, passkey uint32) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, passkey)
-	api.send(5, 4, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(5, 4, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // SmGetBonds get bonding
-func (api *API) SmGetBonds() {
-	api.send(5, 5, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) SmGetBonds() error {
+	return api.send(5, 5, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // SmSetOobData set oob data
-func (api *API) SmSetOobData(oob []byte) {
+func (api *API) SmSetOobData(oob []byte) error {
 	data := append([]byte{byte(len(oob))}, oob...)
-	api.send(5, 6, data, func(buf *bytes.Buffer) {})
+	return api.send(5, 6, data, func(buf *bytes.Buffer) {})
 }
 
 // GapSetPrivacyFlags set GAP privacy flags
-func (api *API) GapSetPrivacyFlags(periphPrivacy byte, centralPrivacy byte) {
-	api.send(6, 0, []byte{periphPrivacy, centralPrivacy}, func(buf *bytes.Buffer) {})
+func (api *API) GapSetPrivacyFlags(periphPrivacy byte, centralPrivacy byte) error {
+	return api.send(6, 0, []byte{periphPrivacy, centralPrivacy}, func(buf *bytes.Buffer) {})
 }
 
 // GapSetMode set GAP mode
-func (api *API) GapSetMode(discover byte, connect byte) {
-	api.send(6, 1, []byte{discover, connect}, func(buf *bytes.Buffer) {})
+func (api *API) GapSetMode(discover byte, connect byte) error {
+	return api.send(6, 1, []byte{discover, connect}, func(buf *bytes.Buffer) {})
 }
 
 // GapDiscover set GAP discovery mode
-func (api *API) GapDiscover(mode byte) {
-	api.send(6, 2, []byte{mode}, func(buf *bytes.Buffer) {})
+func (api *API) GapDiscover(mode byte) error {
+	return api.send(6, 2, []byte{mode}, func(buf *bytes.Buffer) {})
 }
 
 // GapConnectDirect set GAP connection parameters for directed discovery
-func (api *API) GapConnectDirect(address []byte, addrType byte, params *ConnectionParameters) {
+func (api *API) GapConnectDirect(mac QualifiedMac, params *ConnectionParameters) error {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, address)
-	binary.Write(buf, binary.LittleEndian, addrType)
+	binary.Write(buf, binary.LittleEndian, mac.Address)
+	binary.Write(buf, binary.LittleEndian, mac.AddrType)
 	binary.Write(buf, binary.LittleEndian, params)
-	api.send(6, 3, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(6, 3, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // GapEndProcedure end GAP procedure
-func (api *API) GapEndProcedure() {
-	api.send(6, 4, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) GapEndProcedure() error {
+	return api.send(6, 4, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // GapConnectSelective set GAP connetion paramters for selective discovery
-func (api *API) GapConnectSelective(params *ConnectionParameters) {
+func (api *API) GapConnectSelective(params *ConnectionParameters) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, params)
-	api.send(6, 5, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(6, 5, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // GapSetFiltering set GAP filtering policy
-func (api *API) GapSetFiltering(scanPolicy byte, advPolicy byte, scanDuplicateFiltering byte) {
-	api.send(6, 6, []byte{scanPolicy, advPolicy, scanDuplicateFiltering}, func(buf *bytes.Buffer) {})
+func (api *API) GapSetFiltering(scanPolicy byte, advPolicy byte, scanDuplicateFiltering byte) error {
+	return api.send(6, 6, []byte{scanPolicy, advPolicy, scanDuplicateFiltering}, func(buf *bytes.Buffer) {})
 }
 
 // GapSetScanParameters set GAP scanning parameters
-func (api *API) GapSetScanParameters(scanInterval uint16, scanWindow uint16, active byte) {
+func (api *API) GapSetScanParameters(scanInterval uint16, scanWindow uint16, active byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, scanInterval)
 	binary.Write(buf, binary.LittleEndian, scanWindow)
 	binary.Write(buf, binary.LittleEndian, active)
-	api.send(6, 7, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(6, 7, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // GapSetAdvParameters set GAP advertisement parameters
-func (api *API) GapSetAdvParameters(intervalMin uint16, intervalMax uint16, channels uint8) {
+func (api *API) GapSetAdvParameters(intervalMin uint16, intervalMax uint16, channels uint8) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, intervalMin)
 	binary.Write(buf, binary.LittleEndian, intervalMax)
 	binary.Write(buf, binary.LittleEndian, channels)
-	api.send(6, 8, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(6, 8, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // GapSetAdvData set GAP advertisement data
-func (api *API) GapSetAdvData(setScanResp byte, advData []byte) {
+func (api *API) GapSetAdvData(setScanResp byte, advData []byte) error {
 	data := append([]byte{setScanResp, byte(len(advData))}, advData...)
-	api.send(6, 9, data, func(buf *bytes.Buffer) {})
+	return api.send(6, 9, data, func(buf *bytes.Buffer) {})
 }
 
 // GapSetDirectedConnectableMode set directed connectable mode
-func (api *API) GapSetDirectedConnectableMode(address []byte, addrType byte) {
+func (api *API) GapSetDirectedConnectableMode(address []byte, addrType byte) error {
 	data := append(address, []byte{addrType}...)
-	api.send(6, 10, data, func(buf *bytes.Buffer) {})
+	return api.send(6, 10, data, func(buf *bytes.Buffer) {})
 }
 
 // HardwareIoPortConfigIrq configure the port's IRQ
-func (api *API) HardwareIoPortConfigIrq(port byte, enableBits byte, fallingEdge byte) {
-	api.send(7, 0, []byte{port, enableBits, fallingEdge}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareIoPortConfigIrq(port byte, enableBits byte, fallingEdge byte) error {
+	return api.send(7, 0, []byte{port, enableBits, fallingEdge}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareSetSoftTimer configure the soft timer
-func (api *API) HardwareSetSoftTimer(time uint32, handle byte, singleShot byte) {
+func (api *API) HardwareSetSoftTimer(time uint32, handle byte, singleShot byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, time)
 	binary.Write(buf, binary.LittleEndian, handle)
 	binary.Write(buf, binary.LittleEndian, singleShot)
-	api.send(7, 1, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(7, 1, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // HardwareAdcRead read the ADC value
-func (api *API) HardwareAdcRead(input byte, decimation byte, refrenceSelection byte) {
-	api.send(7, 2, []byte{input, decimation, refrenceSelection}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareAdcRead(input byte, decimation byte, refrenceSelection byte) error {
+	return api.send(7, 2, []byte{input, decimation, refrenceSelection}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareIoPortConfgDirection configure the IO's direction
-func (api *API) HardwareIoPortConfgDirection(port byte, direction byte) {
-	api.send(7, 3, []byte{port, direction}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareIoPortConfgDirection(port byte, direction byte) error {
+	return api.send(7, 3, []byte{port, direction}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareIoPortConfigFunction configure the IO's function
-func (api *API) HardwareIoPortConfigFunction(port byte, function byte) {
-	api.send(7, 4, []byte{port, function}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareIoPortConfigFunction(port byte, function byte) error {
+	return api.send(7, 4, []byte{port, function}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareIoPortConfigPull configure the port as pullUp
-func (api *API) HardwareIoPortConfigPull(port byte, triStateMask byte, pullUp byte) {
-	api.send(7, 5, []byte{port, triStateMask, pullUp}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareIoPortConfigPull(port byte, triStateMask byte, pullUp byte) error {
+	return api.send(7, 5, []byte{port, triStateMask, pullUp}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareIoPortWrite write to IO
-func (api *API) HardwareIoPortWrite(port byte, mask byte, data byte) {
-	api.send(7, 6, []byte{port, mask, data}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareIoPortWrite(port byte, mask byte, data byte) error {
+	return api.send(7, 6, []byte{port, mask, data}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareIoPortRead read from IO
-func (api *API) HardwareIoPortRead(port byte, mask byte) {
-	api.send(7, 7, []byte{port, mask}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareIoPortRead(port byte, mask byte) error {
+	return api.send(7, 7, []byte{port, mask}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareSpiConfig configure SPI
-func (api *API) HardwareSpiConfig(channel byte, config *SpiConfig) {
+func (api *API) HardwareSpiConfig(channel byte, config *SpiConfig) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, channel)
 	binary.Write(buf, binary.LittleEndian, config)
-	api.send(7, 8, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(7, 8, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // HardwareSpiTx SPI transmit
-func (api *API) HardwareSpiTx(channel byte, data []byte) {
+func (api *API) HardwareSpiTx(channel byte, data []byte) error {
 	toSend := append([]byte{channel, byte(len(data))}, data...)
-	api.send(7, 9, toSend, func(buf *bytes.Buffer) {})
+	return api.send(7, 9, toSend, func(buf *bytes.Buffer) {})
 }
 
 // HardwareI2cRead read I2C device
-func (api *API) HardwareI2cRead(address byte, stop byte, length byte) {
-	api.send(7, 10, []byte{address, stop, length}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareI2cRead(address byte, stop byte, length byte) error {
+	return api.send(7, 10, []byte{address, stop, length}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareI2cWrite write I2C device
-func (api *API) HardwareI2cWrite(address byte, stop byte, data []byte) {
+func (api *API) HardwareI2cWrite(address byte, stop byte, data []byte) error {
 	toSend := append([]byte{address, stop, byte(len(data))}, data...)
-	api.send(7, 11, toSend, func(buf *bytes.Buffer) {})
+	return api.send(7, 11, toSend, func(buf *bytes.Buffer) {})
 }
 
 // HardwareI2cSetTxPower set I2C transmit power
-func (api *API) HardwareI2cSetTxPower(power byte) {
-	api.send(7, 12, []byte{power}, func(buf *bytes.Buffer) {})
+func (api *API) HardwareI2cSetTxPower(power byte) error {
+	return api.send(7, 12, []byte{power}, func(buf *bytes.Buffer) {})
 }
 
 // HardwareTimerComparitor configure the hardware timer comparitor
-func (api *API) HardwareTimerComparitor(timer byte, channel byte, mode byte, comparitorValue uint16) {
+func (api *API) HardwareTimerComparitor(timer byte, channel byte, mode byte, comparitorValue uint16) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, timer)
 	binary.Write(buf, binary.LittleEndian, channel)
 	binary.Write(buf, binary.LittleEndian, mode)
 	binary.Write(buf, binary.LittleEndian, comparitorValue)
-	api.send(7, 13, buf.Bytes(), func(buf *bytes.Buffer) {})
+	return api.send(7, 13, buf.Bytes(), func(buf *bytes.Buffer) {})
 }
 
 // TestPhyTx test transmiter
-func (api *API) TestPhyTx(channel byte, length byte, testType byte) {
-	api.send(8, 0, []byte{channel, length, testType}, func(buf *bytes.Buffer) {})
+func (api *API) TestPhyTx(channel byte, length byte, testType byte) error {
+	return api.send(8, 0, []byte{channel, length, testType}, func(buf *bytes.Buffer) {})
 }
 
 // TestPhyRx test receiver
-func (api *API) TestPhyRx(channel byte) {
-	api.send(8, 1, []byte{channel}, func(buf *bytes.Buffer) {})
+func (api *API) TestPhyRx(channel byte) error {
+	return api.send(8, 1, []byte{channel}, func(buf *bytes.Buffer) {})
 }
 
 // TestPhyEnd test end
-func (api *API) TestPhyEnd() {
-	api.send(8, 2, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) TestPhyEnd() error {
+	return api.send(8, 2, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // TestPhyReset test reset
-func (api *API) TestPhyReset() {
-	api.send(8, 3, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) TestPhyReset() error {
+	return api.send(8, 3, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // TestGetChannelMap test get channel map
-func (api *API) TestGetChannelMap() {
-	api.send(8, 4, []byte{}, func(buf *bytes.Buffer) {})
+func (api *API) TestGetChannelMap() error {
+	return api.send(8, 4, []byte{}, func(buf *bytes.Buffer) {})
 }
 
 // TestDebug loopback?
-func (api *API) TestDebug(data []byte) {
+func (api *API) TestDebug(data []byte) error {
 	toSend := append([]byte{byte(len(data))}, data...)
-	api.send(8, 5, toSend, func(buf *bytes.Buffer) {})
+	return api.send(8, 5, toSend, func(buf *bytes.Buffer) {})
 }
 
 //
